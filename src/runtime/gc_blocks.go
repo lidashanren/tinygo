@@ -33,6 +33,7 @@ package runtime
 import (
 	"internal/task"
 	"runtime/interrupt"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -56,6 +57,7 @@ var (
 	gcTotalAlloc  uint64         // total number of bytes allocated
 	gcMallocs     uint64         // total number of allocations
 	gcLock        task.PMutex    // lock to avoid race conditions on multicore systems
+	headerOffset  uintptr        // cache header offset for alloc/free
 )
 
 // zeroSizedAlloc is just a sentinel that gets returned when allocating 0 bytes.
@@ -313,6 +315,9 @@ func isOnHeap(ptr uintptr) bool {
 func initHeap() {
 	calculateHeapAddresses()
 
+	// Cache header offset for alloc/free
+	headerOffset = align(unsafe.Sizeof(objHeader{}))
+
 	// Set all block states to 'free'.
 	metadataSize := heapEnd - uintptr(metadataStart)
 	memzero(unsafe.Pointer(metadataStart), metadataSize)
@@ -471,9 +476,8 @@ func alloc(size uintptr, layout unsafe.Pointer) unsafe.Pointer {
 	gcLock.Unlock()
 
 	// Return a pointer to this allocation.
-	add := align(unsafe.Sizeof(objHeader{}))
-	pointer = unsafe.Add(pointer, add)
-	size -= add
+	pointer = unsafe.Add(pointer, headerOffset)
+	size -= headerOffset
 	memzero(pointer, size)
 	return pointer
 }
@@ -502,6 +506,73 @@ func realloc(ptr unsafe.Pointer, size uintptr) unsafe.Pointer {
 
 func free(ptr unsafe.Pointer) {
 	// TODO: free blocks on request, when the compiler knows they're unused.
+}
+
+//go:inline
+func do_free(ptr unsafe.Pointer) {
+	if ptr == nil || ptr == unsafe.Pointer(&zeroSizedAlloc) || interrupt.In() {
+		return
+	}
+
+	// Only allow freeing heap pointers. Ignore otherwise.
+	ptrAddr := uintptr(ptr)
+	if !isOnHeap(ptrAddr) {
+		return
+	}
+
+	gcLock.Lock()
+
+	// Find the head of the allocation and the block just past the tail.
+	head := blockFromAddr(ptrAddr).findHead()
+	// If already free, nothing to do.
+	if head.state() == blockStateFree {
+		gcLock.Unlock()
+		return
+	}
+
+	endBlock := head.findNext()
+	// Clear the state nibble for every block in the allocation to mark them free.
+	for b := head; b < endBlock; b++ {
+		stateBytePtr := (*uint8)(unsafe.Add(metadataStart, b/blocksPerStateByte))
+		shift := b % blocksPerStateByte
+		*stateBytePtr &^= uint8(blockStateMask) << shift
+	}
+
+	// Insert this range back into the free list so it can be reused.
+	insertFreeRange(head.pointer(), uintptr(endBlock-head))
+
+	gcLock.Unlock()
+}
+
+// Free releases memory previously allocated on the heap. The pointer must
+// point to the start of a heap allocation (or somewhere inside it). Calling
+// Free on pointers that are not heap allocations is a no-op. Use with caution
+// — freeing memory that is still in use leads to undefined behaviour.
+//
+//go:inline
+func Free(ptr unsafe.Pointer) {
+	do_free(ptr)
+}
+
+// FreeOnce atomically frees the pointer stored in *ptr and sets *ptr to nil.
+// It returns true if this call performed the free, false if the pointer was
+// already nil (another goroutine or earlier call already freed it).
+//
+// Usage:
+//
+//	var p unsafe.Pointer = unsafe.Pointer(obj)
+//	freed := FreeOnce(&p)
+//
+// This is safe for concurrent use from multiple goroutines.
+//
+//go:inline
+func FreeOnce(ptr *unsafe.Pointer) bool {
+	old := atomic.SwapPointer(ptr, nil)
+	if old == nil {
+		return false
+	}
+	do_free(old)
+	return true
 }
 
 // GC performs a garbage collection cycle.
