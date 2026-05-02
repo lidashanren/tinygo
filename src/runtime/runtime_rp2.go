@@ -319,13 +319,12 @@ func (l *spinLock) Lock() {
 	// Wait for the lock to be available.
 	spinlock := l.spinlock()
 	for spinlock.Get() == 0 {
-		arm.Asm("wfe")
+		arm.Asm("nop")
 	}
 }
 
 func (l *spinLock) Unlock() {
 	l.spinlock().Set(0)
-	arm.Asm("sev")
 }
 
 // Wait until a signal is received, indicating that it can resume from the
