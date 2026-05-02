@@ -72,7 +72,7 @@ var startTask [0]uint8
 // start creates and starts a new goroutine with the given function and arguments.
 // The new goroutine is scheduled to run later.
 func start(fn uintptr, args unsafe.Pointer, stackSize uintptr) {
-	t := &Task{}
+	t := &Task{Affinity: -1}
 	t.state.initialize(fn, args, stackSize)
 	scheduleTask(t)
 }
